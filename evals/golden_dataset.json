@@ -1,0 +1,66 @@
+[
+  {
+    "id": "password-rules",
+    "question": "How long must passwords be, and how often are they rotated?",
+    "expected_intent": "policy_question",
+    "expected_docs": ["access_control_policy.md"],
+    "must_be_grounded": true,
+    "answer_keywords": ["14", "90"]
+  },
+  {
+    "id": "admin-mfa",
+    "question": "What MFA requirement applies to administrative accounts?",
+    "expected_intent": "policy_question",
+    "expected_docs": ["access_control_policy.md"],
+    "must_be_grounded": true,
+    "answer_keywords": ["hardware"]
+  },
+  {
+    "id": "incident-notification",
+    "question": "Who must be notified within 24 hours of a confirmed critical incident?",
+    "expected_intent": "policy_question",
+    "expected_docs": ["incident_response_policy.md"],
+    "must_be_grounded": true,
+    "answer_keywords": ["Chief Information Security Officer", "legal"]
+  },
+  {
+    "id": "financial-retention",
+    "question": "How long are financial records retained?",
+    "expected_intent": "policy_question",
+    "expected_docs": ["data_retention_policy.md"],
+    "must_be_grounded": true,
+    "answer_keywords": ["7 years"]
+  },
+  {
+    "id": "log-retention",
+    "question": "How long are system security logs kept?",
+    "expected_intent": "policy_question",
+    "expected_docs": ["data_retention_policy.md"],
+    "must_be_grounded": true,
+    "answer_keywords": ["13 months"]
+  },
+  {
+    "id": "unanswerable-biometric",
+    "question": "Does the access control policy require biometric login for all users?",
+    "expected_intent": "policy_question",
+    "expected_docs": ["access_control_policy.md"],
+    "must_be_grounded": false,
+    "answer_keywords": []
+  },
+  {
+    "id": "offtopic-weather",
+    "question": "What is the weather in Paris today?",
+    "expected_intent": "off_topic",
+    "expected_docs": [],
+    "must_be_grounded": false,
+    "answer_keywords": []
+  },
+  {
+    "id": "offtopic-poem",
+    "question": "Write me a poem about mountain climbing.",
+    "expected_intent": "off_topic",
+    "expected_docs": [],
+    "must_be_grounded": false,
+    "answer_keywords": []
+  }
+]
