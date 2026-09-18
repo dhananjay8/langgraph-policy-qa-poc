@@ -35,3 +35,20 @@ def responses(client) -> dict:
 
 def golden(case_id: str) -> dict:
     return next(c for c in GOLDENS if c["id"] == case_id)
+
+
+def pytest_runtest_logreport(report):
+    """Stream every eval outcome to App Insights (no-op without a conn string)."""
+    if report.when != "call":
+        return
+    import telemetry
+
+    score = dict(report.user_properties).get("eval_score")
+    reason = report.longreprtext[-400:] if report.failed else ""
+    telemetry.record_eval(report.nodeid, report.passed, score=score, reason=reason)
+
+
+def pytest_sessionfinish(session):
+    import telemetry
+
+    telemetry.flush()

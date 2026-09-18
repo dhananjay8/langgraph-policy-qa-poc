@@ -20,16 +20,17 @@ ANSWERED = [c for c in GOLDENS if c["expected_intent"] == "policy_question"]
 
 
 @pytest.mark.parametrize("case", ANSWERED, ids=[c["id"] for c in ANSWERED])
-def test_answer_relevancy(case, responses):
+def test_answer_relevancy(case, responses, record_property):
     body = responses[case["id"]]["response"]
     test_case = LLMTestCase(input=case["question"], actual_output=body["answer"] or "")
     metric = AnswerRelevancyMetric(threshold=0.7, model=judge)
     metric.measure(test_case)
+    record_property("eval_score", metric.score)
     assert metric.is_successful(), metric.reason
 
 
 @pytest.mark.parametrize("case", ANSWERED, ids=[c["id"] for c in ANSWERED])
-def test_faithfulness(case, responses):
+def test_faithfulness(case, responses, record_property):
     body = responses[case["id"]]["response"]
     context = [c["quote"] for c in body["citations"]]
     if not context:
@@ -41,4 +42,5 @@ def test_faithfulness(case, responses):
     )
     metric = FaithfulnessMetric(threshold=0.8, model=judge, include_reason=True)
     metric.measure(test_case)
+    record_property("eval_score", metric.score)
     assert metric.is_successful(), metric.reason

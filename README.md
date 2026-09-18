@@ -10,29 +10,45 @@ against the live endpoint.
 ```mermaid
 graph TD
     A[POST /v1/qa/:thread_id] --> B[classify<br/>LLM: policy_question vs off_topic]
-    B -->|policy_question| C[retrieve<br/>keyword scoring over paragraph chunks]
+    B -->|policy_question| C[retrieve<br/>hybrid: semantic + keyword scoring]
     B -->|off_topic| D[clarify<br/>fixed refusal]
     C --> E[generate<br/>LLM: answer + verbatim citations]
     E --> F[validate<br/>deterministic: quote must be substring of cited doc]
-    F --> G[JSON response<br/>answer + citations + grounded flag]
+    F -->|all citations dropped<br/>retries remaining| E
+    F -->|grounded or retries exhausted| G[JSON response<br/>answer + citations + grounded flag]
     D --> G
 ```
 
 The graph deliberately mirrors a grounded-evaluation pipeline: LLM nodes
 produce candidate output, then a deterministic node verifies every citation
-is verbatim in the cited document before `grounded` is set. An answer with
-zero surviving citations is replaced by an "insufficient evidence" response.
+is verbatim in the cited document before `grounded` is set. If validation
+drops all citations, the graph retries generation once with a stricter
+prompt before falling back to an "insufficient evidence" response.
+
+### Key capabilities
+
+- **Hybrid retrieval** — Azure OpenAI embeddings + FAISS semantic search,
+  combined with keyword-overlap scoring. Falls back to keyword-only when
+  embeddings are unavailable.
+- **Multi-turn conversation** — Q&A history is accumulated per `thread_id`
+  via a MemorySaver checkpointer and injected into classify/generate prompts
+  so follow-up questions resolve correctly.
+- **Self-correction loop** — If `validate` drops all citations, the graph
+  retries `generate` once with a stricter verbatim-copying prompt.
+- **SSE streaming** — `POST /v1/qa/{thread_id}/stream` streams node-by-node
+  progress as Server-Sent Events.
 
 ## Layout
 
 | Path | Purpose |
 | --- | --- |
-| `app/main.py` | FastAPI app, `/healthz`, `POST /v1/qa/{thread_id}`, API-key auth |
-| `app/graph.py` | LangGraph `StateGraph`: classify → retrieve → generate → validate |
-| `app/retriever.py` | Paragraph chunking + normalized keyword-overlap scoring + verbatim quote check |
+| `app/main.py` | FastAPI app, `/healthz`, `POST /v1/qa/{thread_id}`, SSE stream endpoint, API-key auth |
+| `app/graph.py` | LangGraph `StateGraph`: classify → retrieve → generate → validate (with retry loop) |
+| `app/retriever.py` | Hybrid retrieval: FAISS semantic + keyword scoring, section metadata, verbatim check |
 | `app/llm.py` | Azure OpenAI client (JSON-mode chat, empty-dict fallback on failure) |
 | `app/data/*.md` | Three bundled sample policies (access control, incident response, data retention) |
 | `evals/` | DeepEval + pytest harness that evaluates the deployed service |
+| `.github/workflows/eval.yml` | CI pipeline: deterministic tests then LLM-judged metrics on every push/PR |
 
 ## Azure deployment
 
@@ -43,10 +59,51 @@ zero surviving citations is replaced by an "insufficient evidence" response.
 | Container registry | `acrlgpoc2675231837` | Basic; image `policy-qa:0.1.0` via remote `az acr build` |
 | Container Apps env | `cae-lgpoc` | consumption plan |
 | Container app | `ca-policy-qa` | HTTPS ingress, system-assigned identity, AcrPull |
+| Application Insights | `ai-policy-qa` | workspace-based, shares the env's Log Analytics workspace |
 
-Secrets (`POC_API_KEY`, `AZURE_OPENAI_API_KEY`) are stored as Container Apps
+Secrets (`POC_API_KEY`, `AZURE_OPENAI_API_KEY`,
+`APPLICATIONINSIGHTS_CONNECTION_STRING`) are stored as Container Apps
 secrets and injected via `secretref`; the registry is accessed with a
 system-assigned managed identity, not admin credentials.
+
+## Observability
+
+The app is instrumented with OpenTelemetry via `azure-monitor-opentelemetry`
+(FastAPI auto-instrumentation + explicit per-node spans + the OpenAI client
+dependency calls). Each request produces a distributed trace:
+
+`POST /v1/qa/{thread_id}` → `graph.node.classify` → `graph.node.retrieve` →
+`graph.node.generate` → `graph.node.validate` (+ `POST .../chat/completions`
+spans to Azure OpenAI inside the LLM nodes).
+
+View it in the Azure portal under **Application Insights → ai-policy-qa**:
+
+- **Transaction search** — pick any `POST /v1/qa` request to see the full
+  node-by-node waterfall with per-node attributes (`graph.intent`,
+  `graph.citations_count`, `graph.grounded`).
+- **Application map** — service → Azure OpenAI dependency topology.
+- **Metrics** — custom counters `qa.invocations` (by `intent`, `grounded`)
+  and `qa.citations.valid` for charting.
+- **Logs** — KQL over `requests`/`dependencies`/`traces`/`customMetrics`.
+
+Eval runs also stream results as spans named `eval::<nodeid>` carrying
+`eval.passed` / `eval.score` / `eval.reason`, so eval outcomes are queryable
+and chartable in the same workspace. Useful KQL:
+
+```kusto
+// node latency per request
+dependencies | where name startswith "graph.node." | summarize avg(duration) by name
+
+// eval results over time
+dependencies | where name startswith "eval::"
+| extend passed = tobool(customDimensions["eval.passed"])
+| summarize pass_rate = countif(passed) * 100.0 / count() by bin(timestamp, 1h)
+```
+
+**Gotcha encountered**: App Insights connection strings contain `;`
+separators — they must be quoted when sourced in a shell env file,
+otherwise only `InstrumentationKey` survives and the exporter falls back
+to the global endpoint, whose regional redirect it refuses.
 
 Deploy steps are recorded in `azure/deploy.md`.
 
@@ -62,8 +119,13 @@ Two layers, run with `pytest evals/`:
    `AnswerRelevancyMetric` and `FaithfulnessMetric` using Azure OpenAI
    (`gpt-5-nano`) as judge. Quality signals, not correctness gates.
 
-Golden cases live in `evals/golden_dataset.json` (8 cases: answerable
-policy questions, an unanswerable one, and two off-topic refusals).
+Golden cases live in `evals/golden_dataset.json` (16 cases: answerable
+policy questions across all three documents, cross-policy comparisons,
+unanswerable edge cases, adversarial prompt injection, and off-topic
+refusals).
+
+CI runs automatically on push/PR via `.github/workflows/eval.yml` —
+deterministic tests gate first, then LLM-judged metrics run if those pass.
 
 ### Running evals
 

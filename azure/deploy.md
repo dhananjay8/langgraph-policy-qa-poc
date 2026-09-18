@@ -45,6 +45,25 @@ Endpoint: `https://ca-policy-qa.greenpond-2080be32.eastus.azurecontainerapps.io`
 The CLI automatically granted the app's system-assigned identity `AcrPull`
 on the registry.
 
+### Observability
+
+```bash
+az monitor app-insights component create \
+  --app ai-policy-qa -g rg-langgraph-eval-poc --location eastus \
+  --kind web --application-type web \
+  --workspace <log-analytics-workspace-id>
+
+az containerapp secret set -n ca-policy-qa -g rg-langgraph-eval-poc \
+  --secrets appinsights-conn="<full connection string>"
+# then add env var APPLICATIONINSIGHTS_CONNECTION_STRING=secretref:appinsights-conn
+# and restart the active revision
+```
+
+Important: quote the connection string wherever it is stored for shell
+consumption — its `;` separators truncate it to just the instrumentation
+key otherwise, which makes the exporter target the global endpoint and
+drop data ("Refusing cross-origin redirect").
+
 ## Notes
 
 - `gpt-4o-mini` could not be deployed (model in deprecating state);

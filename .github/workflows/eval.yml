@@ -1,0 +1,63 @@
+name: Eval Suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  DEEPEVAL_TELEMETRY_OPT_OUT: "YES"
+
+jobs:
+  deterministic:
+    name: Deterministic contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r evals/requirements.txt
+
+      - name: Run deterministic evals
+        env:
+          POC_BASE_URL: ${{ vars.POC_BASE_URL }}
+          POC_API_KEY: ${{ secrets.POC_API_KEY }}
+        run: python -m pytest evals/test_deterministic.py -v --tb=short
+
+  llm-judged:
+    name: LLM-judged quality metrics
+    runs-on: ubuntu-latest
+    needs: deterministic
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r evals/requirements.txt
+
+      - name: Run LLM-judged evals
+        env:
+          POC_BASE_URL: ${{ vars.POC_BASE_URL }}
+          POC_API_KEY: ${{ secrets.POC_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ vars.AZURE_OPENAI_DEPLOYMENT }}
+          AZURE_OPENAI_API_VERSION: ${{ vars.AZURE_OPENAI_API_VERSION }}
+          AZURE_OPENAI_DEPLOYMENT_NAME: ${{ vars.AZURE_OPENAI_DEPLOYMENT }}
+          OPENAI_API_VERSION: ${{ vars.AZURE_OPENAI_API_VERSION }}
+          APPLICATIONINSIGHTS_CONNECTION_STRING: ${{ secrets.APPLICATIONINSIGHTS_CONNECTION_STRING }}
+        run: python -m pytest evals/test_llm_judged.py -v --tb=short

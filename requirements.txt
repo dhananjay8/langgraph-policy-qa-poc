@@ -3,3 +3,6 @@ uvicorn[standard]>=0.30
 langgraph>=0.4
 openai>=1.60
 pydantic>=2.9
+azure-monitor-opentelemetry>=1.6
+numpy>=1.26
+faiss-cpu>=1.8
