@@ -39,7 +39,9 @@ prompt before falling back to an "insufficient evidence" response.
   reducing noise and improving citation quality.
 - **Multi-turn conversation** — Q&A history is accumulated per `thread_id`
   via a MemorySaver checkpointer and injected into classify/generate prompts
-  so follow-up questions resolve correctly.
+  so follow-up questions resolve correctly. **Note:** `MemorySaver` is
+  in-memory; state is lost on restart or when requests hit different replicas.
+  For production, swap to a persistent checkpointer (Redis, Cosmos DB).
 - **Self-correction loop** — If `validate` drops all citations, the graph
   retries `generate` once with a stricter verbatim-copying prompt.
 - **SSE streaming** — `POST /v1/qa/{thread_id}/stream` streams node-by-node
@@ -65,6 +67,7 @@ prompt before falling back to an "insufficient evidence" response.
 | `app/retriever.py` | Hybrid retrieval: FAISS semantic + keyword scoring, section metadata, verbatim check |
 | `app/llm.py` | Azure OpenAI client: `chat_json` + `chat_structured` (JSON schema), tenacity retry |
 | `app/data/*.md` | Three bundled sample policies (access control, incident response, data retention) |
+| `tests/` | Offline unit tests: guard, retriever, validate, API endpoints, rate limiter |
 | `evals/` | DeepEval + pytest harness that evaluates the deployed service |
 | `.github/workflows/eval.yml` | CI pipeline: deterministic tests then LLM-judged metrics on every push/PR |
 | `infra/main.bicep` | Reproducible Azure Bicep template (OpenAI, ACR, Container Apps, App Insights) |
@@ -177,9 +180,22 @@ export DEEPEVAL_TELEMETRY_OPT_OUT=YES
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-set -a && source .env.azure && set +a
+cp .env.example .env    # fill in your Azure credentials
+set -a && source .env && set +a
 POC_API_KEY=dev-key .venv/bin/uvicorn app.main:app --port 8000
 ```
+
+### Running unit tests
+
+```bash
+POC_API_KEY=test-key \
+AZURE_OPENAI_ENDPOINT=https://fake.openai.azure.com/ \
+AZURE_OPENAI_API_KEY=fake-key \
+.venv/bin/python -m pytest tests/ -v
+```
+
+Unit tests require no external services — they exercise the guard, retriever,
+validate, and API layers in isolation.
 
 ## Known observation
 

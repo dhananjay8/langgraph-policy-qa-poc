@@ -23,12 +23,14 @@ log = logging.getLogger("policy-qa.retriever")
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _HEADING_RE = re.compile(r"^##\s+(.+)", re.MULTILINE)
+_WS_RE = re.compile(r"\s+")
 
 _docs: dict[str, str] | None = None
 _chunks: list[dict] | None = None
 _faiss_index: Any = None
 _chunk_embeddings: np.ndarray | None = None
 _embedding_dim: int = 0
+_embed_client: Any = None
 
 # ---------------------------------------------------------------------------
 # Document & chunk loading
@@ -73,20 +75,33 @@ def load_chunks() -> list[dict]:
 # Embedding helpers
 # ---------------------------------------------------------------------------
 
-def _get_embeddings(texts: list[str]) -> np.ndarray | None:
-    """Call Azure OpenAI embeddings endpoint.  Returns None on any failure."""
+def _get_embed_client() -> Any:
+    """Singleton Azure OpenAI client for embeddings."""
+    global _embed_client
+    if _embed_client is not None:
+        return _embed_client
     try:
         from openai import AzureOpenAI
-
         endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
         api_key = os.environ.get("AZURE_OPENAI_API_KEY", "")
         api_ver = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
-        deploy = os.environ.get("AZURE_OPENAI_EMBED_DEPLOYMENT", "text-embedding-3-small")
         if not endpoint or not api_key:
             return None
-        client = AzureOpenAI(
+        _embed_client = AzureOpenAI(
             azure_endpoint=endpoint, api_key=api_key, api_version=api_ver,
         )
+        return _embed_client
+    except Exception:
+        return None
+
+
+def _get_embeddings(texts: list[str]) -> np.ndarray | None:
+    """Call Azure OpenAI embeddings endpoint.  Returns None on any failure."""
+    try:
+        client = _get_embed_client()
+        if client is None:
+            return None
+        deploy = os.environ.get("AZURE_OPENAI_EMBED_DEPLOYMENT", "text-embedding-3-small")
         resp = client.embeddings.create(model=deploy, input=texts)
         vecs = [d.embedding for d in resp.data]
         return np.array(vecs, dtype=np.float32)
@@ -184,10 +199,14 @@ def retrieve(question: str, top_k: int = 3) -> list[dict]:
     return merged[:top_k]
 
 
+def normalize_ws(s: str) -> str:
+    """Collapse whitespace to single spaces and strip."""
+    return _WS_RE.sub(" ", s).strip()
+
+
 def quote_in_doc(doc: str, quote: str) -> bool:
     """Deterministic citation check: normalized quote must appear verbatim."""
     text = load_documents().get(doc)
     if text is None:
         return False
-    norm = lambda s: re.sub(r"\s+", " ", s).strip()
-    return norm(quote) in norm(text)
+    return normalize_ws(quote) in normalize_ws(text)

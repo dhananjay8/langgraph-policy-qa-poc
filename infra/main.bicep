@@ -205,4 +205,5 @@ resource acrPullRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 output appUrl string = 'https://${containerApp.properties.configuration.ingress.fqdn}'
 output acrLoginServer string = acr.properties.loginServer
 output openaiEndpoint string = openai.properties.endpoint
-output appInsightsConnectionString string = appInsights.properties.ConnectionString
+// NOTE: appInsightsConnectionString intentionally omitted from outputs
+// (contains ingestion key). Retrieve via: az monitor app-insights component show ...

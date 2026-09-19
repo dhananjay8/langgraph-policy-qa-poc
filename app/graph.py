@@ -22,6 +22,7 @@ Safety: a lightweight guard node screens every input for prompt-injection
 patterns before classify runs, refusing obviously adversarial prompts.
 """
 
+import functools
 import re
 from typing import Annotated, Any, Callable, TypedDict
 
@@ -31,7 +32,7 @@ from opentelemetry import metrics, trace
 
 from . import llm, retriever
 
-MAX_RETRIES = 1
+_MAX_RETRY_ATTEMPTS = 1
 
 tracer = trace.get_tracer("policy-qa.graph")
 meter = metrics.get_meter("policy-qa")
@@ -60,6 +61,7 @@ def traced(name: str) -> Callable:
     """Wrap a graph node in an OTel span carrying its state deltas."""
 
     def deco(fn: Callable) -> Callable:
+        @functools.wraps(fn)
         def wrapped(state: QAState) -> dict:
             with tracer.start_as_current_span(f"graph.node.{name}") as span:
                 result = fn(state)
@@ -89,8 +91,9 @@ INJECTION_REFUSAL = (
 )
 
 _INJECTION_PATTERNS = [
-    r"ignore\s+(all\s+)?(previous|prior|above|your)\s+(instructions|rules|prompts)",
-    r"(disregard|forget|override)\s+(all\s+)?(previous|prior|your)\s+(instructions|rules|prompts)",
+    r"ignore\s+(?:all\s+|your\s+|the\s+)*(?:previous|prior|above)\s+(?:instructions|rules|prompts)",
+    r"ignore\s+(?:all\s+)?(?:instructions|rules|prompts)",
+    r"(disregard|forget|override)\s+(?:all\s+|your\s+|the\s+)*(?:previous|prior)?\s*(?:instructions|rules|prompts)",
     r"you\s+are\s+now\s+(?:a|an|in)\s+",
     r"system\s*prompt",
     r"\bdo\s+anything\s+now\b",
@@ -189,27 +192,57 @@ def retrieve(state: QAState) -> dict:
     return {"retrieved": retriever.retrieve(state["question"])}
 
 
+_RERANK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scores": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "relevance": {"type": "integer"},
+                },
+                "required": ["index", "relevance"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["scores"],
+    "additionalProperties": False,
+}
+
+
 def rerank(state: QAState) -> dict:
-    """LLM-based re-ranking: score each chunk's relevance, drop low scorers."""
+    """LLM-based re-ranking: score all chunks in one batched call."""
     retrieved = state.get("retrieved", [])
     if len(retrieved) <= 1:
         return {}
     question = state["question"]
-    scored = []
-    for chunk in retrieved:
-        system = (
-            "You are a relevance judge. Given a user question and a text excerpt, "
-            "rate relevance from 0 to 10. Reply with json only: "
-            '{"relevance": <integer 0-10>}.'
-        )
-        user_msg = f"Question: {question}\n\nExcerpt [{chunk['doc']}]:\n{chunk['text']}"
-        result = llm.chat_json(system, user_msg)
-        score = result.get("relevance", 5)
+    excerpts = "\n\n".join(
+        f"[{i}] ({c['doc']}, section: {c.get('section', 'N/A')})\n{c['text']}"
+        for i, c in enumerate(retrieved)
+    )
+    system = (
+        "You are a relevance judge. Given a user question and numbered text "
+        "excerpts, rate each excerpt's relevance from 0 to 10. Reply with "
+        "json only: {\"scores\": [{\"index\": 0, \"relevance\": <int>}, ...]}."
+    )
+    user_msg = f"Question: {question}\n\nExcerpts:\n{excerpts}"
+    result = llm.chat_structured(system, user_msg, _RERANK_SCHEMA, "rerank")
+    scores_list = result.get("scores", [])
+    # Build index → relevance map; default to 5 for missing entries
+    score_map: dict[int, int] = {}
+    for entry in scores_list:
         try:
-            score = int(score)
+            idx = int(entry.get("index", -1))
+            rel = int(entry.get("relevance", 5))
+            score_map[idx] = max(0, min(10, rel))
         except (TypeError, ValueError):
-            score = 5
-        scored.append({**chunk, "relevance": score})
+            continue
+    scored = []
+    for i, chunk in enumerate(retrieved):
+        scored.append({**chunk, "relevance": score_map.get(i, 5)})
     # Keep chunks scoring >= 4 (out of 10), sorted descending
     kept = sorted(
         [c for c in scored if c["relevance"] >= 4],
@@ -322,7 +355,7 @@ def validate_route(state: QAState) -> str:
     """After validate: retry generate if citations were all dropped and retries remain."""
     if state.get("grounded"):
         return END
-    if state.get("retry_count", 0) <= MAX_RETRIES:
+    if state.get("retry_count", 0) <= _MAX_RETRY_ATTEMPTS:
         return "generate"
     return END
 

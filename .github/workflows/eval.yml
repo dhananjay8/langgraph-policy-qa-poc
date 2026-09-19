@@ -1,4 +1,4 @@
-name: Eval Suite
+name: CI & Eval Suite
 
 on:
   push:
@@ -10,9 +10,33 @@ env:
   DEEPEVAL_TELEMETRY_OPT_OUT: "YES"
 
 jobs:
+  unit-tests:
+    name: Unit tests (no external services)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Run unit tests
+        env:
+          AZURE_OPENAI_ENDPOINT: "https://fake.openai.azure.com/"
+          AZURE_OPENAI_API_KEY: "fake-key"
+          AZURE_OPENAI_DEPLOYMENT: "gpt-5-nano"
+          POC_API_KEY: "test-key"
+        run: python -m pytest tests/ -v --tb=short
+
   deterministic:
     name: Deterministic contract tests
     runs-on: ubuntu-latest
+    needs: unit-tests
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +44,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install dependencies
         run: |
@@ -43,6 +68,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install dependencies
         run: |
