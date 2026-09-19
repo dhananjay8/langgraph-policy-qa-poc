@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import time
+from collections import defaultdict
 
 if os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING"):
     from azure.monitor.opentelemetry import configure_azure_monitor
@@ -18,8 +19,30 @@ from pydantic import BaseModel, Field
 from .graph import build_graph, qa_invocations, valid_citations
 from .retriever import load_documents
 
-app = FastAPI(title="langgraph-policy-qa-poc", version="0.2.0")
+app = FastAPI(title="langgraph-policy-qa-poc", version="0.3.0")
 graph = build_graph()
+
+_STARTED_AT = time.time()
+
+# ---------------------------------------------------------------------------
+# In-memory sliding-window rate limiter (per API key, 30 req / 60s)
+# ---------------------------------------------------------------------------
+_RATE_LIMIT = int(os.environ.get("RATE_LIMIT_RPM", "30"))
+_RATE_WINDOW = 60.0
+_request_log: dict[str, list[float]] = defaultdict(list)
+
+
+def _check_rate_limit(api_key: str) -> None:
+    now = time.time()
+    window = _request_log[api_key]
+    # Evict expired entries
+    _request_log[api_key] = window = [t for t in window if now - t < _RATE_WINDOW]
+    if len(window) >= _RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded ({_RATE_LIMIT} requests per minute)",
+        )
+    window.append(now)
 
 
 class QARequest(BaseModel):
@@ -31,6 +54,7 @@ def verify_api_key(request: Request) -> None:
     provided = request.headers.get("x-api-key", "")
     if not expected or not secrets.compare_digest(provided, expected):
         raise HTTPException(status_code=401, detail="invalid or missing API key")
+    _check_rate_limit(provided)
 
 
 def _format_result(thread_id: str, result: dict, latency_ms: int) -> dict:
@@ -56,7 +80,7 @@ def _record_metrics(result: dict) -> None:
 async def root() -> dict:
     return {
         "service": "langgraph-policy-qa-poc",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "endpoints": {
             "health": "/healthz",
             "qa": "POST /v1/qa/{thread_id}",
@@ -67,7 +91,32 @@ async def root() -> dict:
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {"status": "ok", "documents": len(load_documents())}
+    docs = load_documents()
+    uptime_s = round(time.time() - _STARTED_AT)
+
+    # Probe LLM connectivity
+    llm_ok = False
+    llm_latency_ms = 0
+    try:
+        from . import llm
+        t0 = time.time()
+        result = await asyncio.to_thread(
+            llm.chat_json,
+            "Reply with json: {\"status\": \"ok\"}",
+            "health check",
+        )
+        llm_latency_ms = round((time.time() - t0) * 1000)
+        llm_ok = result.get("status") == "ok"
+    except Exception:
+        pass
+
+    status = "ok" if llm_ok else "degraded"
+    return {
+        "status": status,
+        "uptime_seconds": uptime_s,
+        "documents": len(docs),
+        "llm": {"reachable": llm_ok, "latency_ms": llm_latency_ms},
+    }
 
 
 @app.post("/v1/qa/{thread_id}", dependencies=[Depends(verify_api_key)])

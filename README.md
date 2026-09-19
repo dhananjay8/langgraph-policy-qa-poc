@@ -9,14 +9,18 @@ against the live endpoint.
 
 ```mermaid
 graph TD
-    A[POST /v1/qa/:thread_id] --> B[classify<br/>LLM: policy_question vs off_topic]
+    A[POST /v1/qa/:thread_id] --> G0[guard<br/>regex injection detection]
+    G0 -->|clean| B[classify<br/>LLM: policy_question vs off_topic]
+    G0 -->|injection| D2[clarify_injection<br/>fixed refusal]
     B -->|policy_question| C[retrieve<br/>hybrid: semantic + keyword scoring]
     B -->|off_topic| D[clarify<br/>fixed refusal]
-    C --> E[generate<br/>LLM: answer + verbatim citations]
+    C --> R[rerank<br/>LLM: score & filter by relevance]
+    R --> E[generate<br/>LLM: answer + verbatim citations]
     E --> F[validate<br/>deterministic: quote must be substring of cited doc]
     F -->|all citations dropped<br/>retries remaining| E
-    F -->|grounded or retries exhausted| G[JSON response<br/>answer + citations + grounded flag]
-    D --> G
+    F -->|grounded or retries exhausted| H[JSON response<br/>answer + citations + grounded flag]
+    D --> H
+    D2 --> H
 ```
 
 The graph deliberately mirrors a grounded-evaluation pipeline: LLM nodes
@@ -30,6 +34,9 @@ prompt before falling back to an "insufficient evidence" response.
 - **Hybrid retrieval** — Azure OpenAI embeddings + FAISS semantic search,
   combined with keyword-overlap scoring. Falls back to keyword-only when
   embeddings are unavailable.
+- **LLM re-ranking** — After retrieval, each chunk is scored 0–10 for
+  relevance by the LLM; low-relevance chunks are dropped before generation,
+  reducing noise and improving citation quality.
 - **Multi-turn conversation** — Q&A history is accumulated per `thread_id`
   via a MemorySaver checkpointer and injected into classify/generate prompts
   so follow-up questions resolve correctly.
@@ -37,18 +44,31 @@ prompt before falling back to an "insufficient evidence" response.
   retries `generate` once with a stricter verbatim-copying prompt.
 - **SSE streaming** — `POST /v1/qa/{thread_id}/stream` streams node-by-node
   progress as Server-Sent Events.
+- **Prompt injection guard** — A regex-based guard node before classify
+  detects common injection patterns and refuses with a fixed message.
+- **Structured output** — `classify` and `generate` use JSON-schema-
+  constrained responses (`response_format: json_schema`) for reliable
+  parsing; falls back to free-form JSON mode if unsupported.
+- **Retry with backoff** — Transient Azure OpenAI errors (rate limit,
+  timeout, connection) are retried 3× with exponential backoff.
+- **Rate limiting** — Per-API-key sliding-window limiter (30 req/min,
+  configurable via `RATE_LIMIT_RPM`).
+- **Deep health check** — `/healthz` probes LLM connectivity, reports
+  uptime and latency alongside document count.
 
 ## Layout
 
 | Path | Purpose |
 | --- | --- |
-| `app/main.py` | FastAPI app, `/healthz`, `POST /v1/qa/{thread_id}`, SSE stream endpoint, API-key auth |
-| `app/graph.py` | LangGraph `StateGraph`: classify → retrieve → generate → validate (with retry loop) |
+| `app/main.py` | FastAPI app, `/healthz` (deep), `POST /v1/qa/{thread_id}`, SSE stream, rate limiter, API-key auth |
+| `app/graph.py` | LangGraph `StateGraph`: guard → classify → retrieve → rerank → generate → validate (with retry loop) |
 | `app/retriever.py` | Hybrid retrieval: FAISS semantic + keyword scoring, section metadata, verbatim check |
-| `app/llm.py` | Azure OpenAI client (JSON-mode chat, empty-dict fallback on failure) |
+| `app/llm.py` | Azure OpenAI client: `chat_json` + `chat_structured` (JSON schema), tenacity retry |
 | `app/data/*.md` | Three bundled sample policies (access control, incident response, data retention) |
 | `evals/` | DeepEval + pytest harness that evaluates the deployed service |
 | `.github/workflows/eval.yml` | CI pipeline: deterministic tests then LLM-judged metrics on every push/PR |
+| `infra/main.bicep` | Reproducible Azure Bicep template (OpenAI, ACR, Container Apps, App Insights) |
+| `infra/parameters.json` | Deployment parameters for the Bicep template |
 
 ## Azure deployment
 
@@ -72,9 +92,10 @@ The app is instrumented with OpenTelemetry via `azure-monitor-opentelemetry`
 (FastAPI auto-instrumentation + explicit per-node spans + the OpenAI client
 dependency calls). Each request produces a distributed trace:
 
-`POST /v1/qa/{thread_id}` → `graph.node.classify` → `graph.node.retrieve` →
-`graph.node.generate` → `graph.node.validate` (+ `POST .../chat/completions`
-spans to Azure OpenAI inside the LLM nodes).
+`POST /v1/qa/{thread_id}` → `graph.node.guard` → `graph.node.classify` →
+`graph.node.retrieve` → `graph.node.rerank` → `graph.node.generate` →
+`graph.node.validate` (+ `POST .../chat/completions` spans to Azure OpenAI
+inside the LLM nodes).
 
 View it in the Azure portal under **Application Insights → ai-policy-qa**:
 
@@ -105,7 +126,21 @@ separators — they must be quoted when sourced in a shell env file,
 otherwise only `InstrumentationKey` survives and the exporter falls back
 to the global endpoint, whose regional redirect it refuses.
 
-Deploy steps are recorded in `azure/deploy.md`.
+### Infrastructure as Code
+
+The `infra/` directory contains a Bicep template (`main.bicep` +
+`parameters.json`) that provisions the full stack reproducibly:
+
+```bash
+az group create --name rg-langgraph-eval-poc --location eastus
+az deployment group create \
+  --resource-group rg-langgraph-eval-poc \
+  --template-file infra/main.bicep \
+  --parameters infra/parameters.json \
+  --parameters pocApiKey='<your-key>'
+```
+
+Manual deploy steps are also recorded in `azure/deploy.md`.
 
 ## Evaluation harness
 

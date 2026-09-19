@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": { "value": "eastus" },
+    "openaiDeploymentName": { "value": "gpt-5-nano" },
+    "openaiModelName": { "value": "gpt-5-nano" },
+    "openaiModelVersion": { "value": "2025-08-07" },
+    "openaiApiVersion": { "value": "2024-10-21" },
+    "imageTag": { "value": "0.2.0" },
+    "pocApiKey": { "value": "" }
+  }
+}

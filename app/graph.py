@@ -1,12 +1,12 @@
 """LangGraph policy Q&A graph.
 
 Flow:
-    classify -> (policy_question | off_topic)
-    policy_question -> retrieve -> generate -> validate ─┐
-                                      ▲                  │
-                                      └── retry ◄────────┤ (if all citations dropped, max 1 retry)
-                                                         ▼
-    off_topic       -> clarify ─────────────────────> END
+    guard -> classify -> (policy_question | off_topic)
+    policy_question -> retrieve -> rerank -> generate -> validate ─┐
+                                                ▲                  │
+                                                └── retry ◄──────┤ (if all citations dropped, max 1 retry)
+                                                                   ▼
+    off_topic / injection -> clarify ─────────────────────> END
 
 Design mirrors a miniature grounded-evaluation pipeline: LLM nodes produce
 candidate output, a deterministic node verifies citations verbatim before the
@@ -17,8 +17,12 @@ response.
 Multi-turn conversation: the graph accumulates a compact Q&A history per
 thread so that follow-up questions ("What about admin accounts?") resolve
 correctly via the MemorySaver checkpointer.
+
+Safety: a lightweight guard node screens every input for prompt-injection
+patterns before classify runs, refusing obviously adversarial prompts.
 """
 
+import re
 from typing import Annotated, Any, Callable, TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -78,6 +82,25 @@ INSUFFICIENT_EVIDENCE = (
     "answer this question."
 )
 
+INJECTION_REFUSAL = (
+    "Your input appears to contain an instruction that conflicts with this "
+    "assistant's purpose. This service only answers questions about the "
+    "bundled policy documents. Please rephrase your question."
+)
+
+_INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?(previous|prior|above|your)\s+(instructions|rules|prompts)",
+    r"(disregard|forget|override)\s+(all\s+)?(previous|prior|your)\s+(instructions|rules|prompts)",
+    r"you\s+are\s+now\s+(?:a|an|in)\s+",
+    r"system\s*prompt",
+    r"\bdo\s+anything\s+now\b",
+    r"\bjailbreak\b",
+    r"\bdan\s+mode\b",
+    r"pretend\s+(?:you\s+are|to\s+be)\s+",
+    r"reveal\s+(your|the)\s+(instructions|system|prompt)",
+    r"output\s+(your|the)\s+(system|initial|original)\s+(prompt|instructions)",
+]
+
 
 def _append_history(existing: list[dict], new: list[dict]) -> list[dict]:
     """Reducer: append new entries, keep last 10 for token budget."""
@@ -108,6 +131,40 @@ def _history_context(state: QAState) -> str:
     return "Recent conversation:\n" + "\n".join(lines) + "\n\n"
 
 
+def guard(state: QAState) -> dict:
+    """Screen input for prompt-injection patterns before classification."""
+    text = state.get("question", "").lower()
+    for pattern in _INJECTION_PATTERNS:
+        if re.search(pattern, text):
+            return {"intent": "injection"}
+    return {}
+
+
+def guard_route(state: QAState) -> str:
+    """Route injection detections straight to clarify."""
+    return "clarify_injection" if state.get("intent") == "injection" else "classify"
+
+
+def clarify_injection(state: QAState) -> dict:
+    return {
+        "answer": INJECTION_REFUSAL,
+        "citations": [],
+        "grounded": False,
+        "retrieved": [],
+        "history": [{"q": state.get("question", ""), "a": INJECTION_REFUSAL}],
+    }
+
+
+_CLASSIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intent": {"type": "string", "enum": ["policy_question", "off_topic"]},
+    },
+    "required": ["intent"],
+    "additionalProperties": False,
+}
+
+
 def classify(state: QAState) -> dict:
     hist = _history_context(state)
     system = (
@@ -117,7 +174,7 @@ def classify(state: QAState) -> dict:
         'or data retention; otherwise {"intent": "off_topic"}.'
     )
     user_msg = f"{hist}Current question: {state['question']}"
-    result = llm.chat_json(system, user_msg)
+    result = llm.chat_structured(system, user_msg, _CLASSIFY_SCHEMA, "classify")
     intent = result.get("intent")
     if intent not in ("policy_question", "off_topic"):
         intent = "off_topic"
@@ -130,6 +187,61 @@ def route(state: QAState) -> str:
 
 def retrieve(state: QAState) -> dict:
     return {"retrieved": retriever.retrieve(state["question"])}
+
+
+def rerank(state: QAState) -> dict:
+    """LLM-based re-ranking: score each chunk's relevance, drop low scorers."""
+    retrieved = state.get("retrieved", [])
+    if len(retrieved) <= 1:
+        return {}
+    question = state["question"]
+    scored = []
+    for chunk in retrieved:
+        system = (
+            "You are a relevance judge. Given a user question and a text excerpt, "
+            "rate relevance from 0 to 10. Reply with json only: "
+            '{"relevance": <integer 0-10>}.'
+        )
+        user_msg = f"Question: {question}\n\nExcerpt [{chunk['doc']}]:\n{chunk['text']}"
+        result = llm.chat_json(system, user_msg)
+        score = result.get("relevance", 5)
+        try:
+            score = int(score)
+        except (TypeError, ValueError):
+            score = 5
+        scored.append({**chunk, "relevance": score})
+    # Keep chunks scoring >= 4 (out of 10), sorted descending
+    kept = sorted(
+        [c for c in scored if c["relevance"] >= 4],
+        key=lambda c: c["relevance"],
+        reverse=True,
+    )
+    # Always keep at least 1 chunk
+    if not kept and scored:
+        kept = [max(scored, key=lambda c: c["relevance"])]
+    return {"retrieved": kept}
+
+
+_GENERATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "citations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "doc": {"type": "string"},
+                    "quote": {"type": "string"},
+                },
+                "required": ["doc", "quote"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["answer", "citations"],
+    "additionalProperties": False,
+}
 
 
 def generate(state: QAState) -> dict:
@@ -163,7 +275,7 @@ def generate(state: QAState) -> dict:
         'question, reply {"answer": "not_answerable", "citations": []}.'
     )
     user = f"{retry_warning}{hist}Question: {state['question']}\n\nExcerpts:\n{context}"
-    result = llm.chat_json(system, user)
+    result = llm.chat_structured(system, user, _GENERATE_SCHEMA, "generate")
     answer = result.get("answer", "")
     citations = result.get("citations")
     if not answer or answer == "not_answerable" or not isinstance(citations, list):
@@ -227,16 +339,22 @@ def clarify(state: QAState) -> dict:
 
 def build_graph() -> Any:
     builder = StateGraph(QAState)
+    builder.add_node("guard", traced("guard")(guard))
     builder.add_node("classify", traced("classify")(classify))
     builder.add_node("retrieve", traced("retrieve")(retrieve))
+    builder.add_node("rerank", traced("rerank")(rerank))
     builder.add_node("generate", traced("generate")(generate))
     builder.add_node("validate", traced("validate")(validate))
     builder.add_node("clarify", traced("clarify")(clarify))
+    builder.add_node("clarify_injection", traced("clarify_injection")(clarify_injection))
 
-    builder.add_edge(START, "classify")
+    builder.add_edge(START, "guard")
+    builder.add_conditional_edges("guard", guard_route, ["classify", "clarify_injection"])
     builder.add_conditional_edges("classify", route, ["retrieve", "clarify"])
-    builder.add_edge("retrieve", "generate")
+    builder.add_edge("retrieve", "rerank")
+    builder.add_edge("rerank", "generate")
     builder.add_edge("generate", "validate")
     builder.add_conditional_edges("validate", validate_route, ["generate", END])
     builder.add_edge("clarify", END)
+    builder.add_edge("clarify_injection", END)
     return builder.compile(checkpointer=MemorySaver())
